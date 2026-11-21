@@ -35,8 +35,7 @@ use crate::devices::{self, format_address, format_ago, format_date, now_filetime
 
 const ID_USE: u16 = 101;
 const ID_RESTART: u16 = 102;
-const ID_POWER_OFF: u16 = 103;
-const ID_POWER_ON: u16 = 104;
+const ID_POWER: u16 = 103;
 const ID_ALL_ON: u16 = 105;
 const ID_FORGET_ADAPTER: u16 = 106;
 const ID_ADAPTER_DETAILS: u16 = 107;
@@ -122,7 +121,7 @@ you want and click \u{201C}Use this adapter\u{201D}. More fixes are in the menus
 
 const TIPS: &str = "Common Windows Bluetooth problems and what to try\n\n\
 \u{2022} Bluetooth stopped working, the on/off toggle vanished, or nothing connects\n    \u{2192} Restart Bluetooth.\n\n\
-\u{2022} Devices disconnect after a while or after the PC wakes from sleep\n    \u{2192} Adapter \u{25B8} Stop power saving.\n\n\
+\u{2022} Devices disconnect after a while or after the PC wakes from sleep\n    \u{2192} Adapter \u{25B8} Power saving: turn it off.\n\n\
 \u{2022} Headphones sound muffled or mono during calls, games or whenever an app opens the mic\n    \u{2192} Select them and turn off the headset mic. They stay in full-quality stereo (use another mic).\n\n\
 \u{2022} Volume is far too loud/quiet, or Windows and headphone volume fight each other\n    \u{2192} Audio \u{25B8} turn Absolute volume off.\n\n\
 \u{2022} A device won't remove in Settings, or shows up twice\n    \u{2192} Select it and Forget device, or Device \u{25B8} Clean up old devices.\n\n\
@@ -340,8 +339,7 @@ unsafe fn build_menu() -> HMENU {
     item(m, ID_USE, "&Use this adapter\tEnter");
     item(m, ID_RESTART, "&Restart Bluetooth");
     sep(m);
-    item(m, ID_POWER_OFF, "&Stop power saving (fixes dropouts)");
-    item(m, ID_POWER_ON, "&Allow power saving");
+    item(m, ID_POWER, "Power &saving (turn off to fix dropouts)");
     sep(m);
     item(m, ID_ALL_ON, "Turn all adapters &back on");
     item(m, ID_FORGET_ADAPTER, "&Forget this adapter");
@@ -795,7 +793,7 @@ impl App {
                 !(a.active && !others_on)
             }),
             ID_RESTART => active_adapter(&snap).is_some(),
-            ID_POWER_OFF | ID_POWER_ON => adapter.is_some_and(|(_, a)| a.node.present),
+            ID_POWER => adapter.is_some(),
             ID_ALL_ON => snap.adapters.iter().any(|a| a.node.disabled),
             ID_FORGET_ADAPTER => adapter.is_some_and(|(_, a)| !a.node.present),
             ID_ADAPTER_DETAILS => adapter.is_some(),
@@ -810,6 +808,7 @@ impl App {
         let Ok(snap) = self.snap.try_borrow() else { return false };
         match id {
             ID_ABSVOL => !snap.absolute_volume_disabled,
+            ID_POWER => self.selected_adapter().and_then(|i| snap.adapters.get(i)).is_some_and(|a| a.power_saving_on()),
             ID_MIC => self
                 .selected_device()
                 .and_then(|s| device_at(&snap, s))
@@ -877,8 +876,7 @@ impl App {
         match id {
             ID_USE => self.cmd_use(),
             ID_RESTART => self.cmd_restart(),
-            ID_POWER_OFF => self.cmd_power(false),
-            ID_POWER_ON => self.cmd_power(true),
+            ID_POWER => self.cmd_power(),
             ID_ALL_ON => self.cmd_all_on(),
             ID_FORGET_ADAPTER => self.cmd_forget_adapter(),
             ID_ADAPTER_DETAILS => self.cmd_adapter_details(),
@@ -974,28 +972,36 @@ impl App {
         };
         if self.confirm(
             "Restart Bluetooth?\n\nThis restarts the Bluetooth service and the adapter \u{2014} the usual fix when Bluetooth \
-             stops working, the toggle disappears or devices refuse to connect. Everything disconnects for a few seconds and \
-             then reconnects.",
+             stops working, the toggle disappears or devices refuse to connect. Everything disconnects and reconnects; \
+             it can take up to a minute.",
         ) {
-            self.start_ops(vec![op], Followup::Message("Bluetooth restarted. Devices reconnect in a few seconds.".to_owned()));
+            self.start_ops(vec![op], Followup::Message("Restart done. Devices reconnect in a few seconds.".to_owned()));
         }
     }
 
-    unsafe fn cmd_power(&self, allow: bool) {
+    unsafe fn cmd_power(&self) {
         let Some(i) = self.selected_adapter() else { return };
-        let op = {
+        let (op, allow, present) = {
             let snap = self.snap.borrow();
             let Some(a) = snap.adapters.get(i) else { return };
-            Op::PowerSaving { id: a.node.id.clone(), label: a.node.name.clone(), allow }
+            let allow = !a.power_saving_on();
+            (Op::PowerSaving { id: a.node.id.clone(), label: a.node.name.clone(), allow }, allow, a.node.present)
         };
-        let text = if allow {
-            "Let Windows turn this adapter off to save power?\n\n(This is the Windows default.)"
+        let mut text = if allow {
+            "Turn power saving back on?\n\nWindows may then switch the adapter off when it's idle (the Windows default)."
+                .to_owned()
         } else {
-            "Stop Windows from turning this adapter off to save power?\n\nThis is the classic fix for devices that drop out \
-             after a while or don't come back after sleep. It costs a tiny bit of battery on laptops."
+            "Turn power saving off for this adapter?\n\nThis stops Windows from switching the adapter off to save power \u{2014} \
+             the classic fix for devices that drop out after a while or don't come back after sleep. It costs a tiny bit \
+             of battery on laptops."
+                .to_owned()
         };
-        if self.confirm(text) {
-            self.start_ops(vec![op], Followup::Message("Power-saving setting updated.".to_owned()));
+        if present {
+            text.push_str("\n\nThe adapter restarts so this takes effect; devices reconnect in a few seconds.");
+        }
+        if self.confirm(&text) {
+            let done = format!("Power saving is now {} for this adapter.", if allow { "on" } else { "off" });
+            self.start_ops(vec![op], Followup::Message(done));
         }
     }
 
@@ -1153,10 +1159,15 @@ impl App {
             };
             let driver_date = a.driver_date.map(format_date).unwrap_or_else(|| "unknown".to_owned());
             format!(
-                "{}\n\nState:\t\t{}\nMade by:\t\t{}\nBluetooth version:\t{}\nAddress:\t\t{}\nDriver:\t\t{} {}\nDriver date:\t{}\n\
-                 Paired devices:\t{}\n\nDevice ID:\n{}\n\nTip: Ctrl+C copies this text.",
+                "{}\n\nState:\t\t{}\nPower saving:\t{}\nMade by:\t\t{}\nBluetooth version:\t{}\nAddress:\t\t{}\n\
+                 Driver:\t\t{} {}\nDriver date:\t{}\nPaired devices:\t{}\n\nDevice ID:\n{}\n\nTip: Ctrl+C copies this text.",
                 a.node.name,
                 a.state_text(),
+                match a.power_saving {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "on (Windows default)",
+                },
                 if a.node.manufacturer.is_empty() { "unknown" } else { &a.node.manufacturer },
                 version,
                 a.address.map(format_address).unwrap_or_else(|| "unknown".to_owned()),

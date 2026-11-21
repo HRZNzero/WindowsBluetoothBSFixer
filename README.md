@@ -14,10 +14,14 @@ One ~500 KB exe, no installer, no runtime. Written in Rust on the raw Win32 API.
   choose it, so a better USB dongle often gets ignored in favour of the built-in chip. Pick the
   adapter you want and the others get switched off, so Windows has to use it. *Turn all adapters
   back on* undoes it.
-- **Restart Bluetooth.** Restarts the Bluetooth Support Service and the adapter. This is the usual fix when
-  Bluetooth stops working, the on/off toggle disappears, or devices refuse to connect.
-- **Stop power saving.** Unticks Device Manager's *Allow the computer to turn off this device
-  to save power*, the classic fix for devices that drop out or don't come back after sleep.
+- **Restart Bluetooth.** Restarts the Bluetooth Support Service (and the per-user Bluetooth
+  service that depends on it) and asks Windows to restart the adapter. This is the usual fix
+  when Bluetooth stops working, the on/off toggle disappears, or devices refuse to connect. If
+  something holds the adapter open, Windows finishes the adapter reset at the next PC restart,
+  and the app says so.
+- **Power saving** on/off. Same as Device Manager's *Allow the computer to turn off this device
+  to save power*, the classic fix for devices that drop out or don't come back after sleep. The
+  current state is shown in the menu and in Details.
 - **Details.** Bluetooth version (5.0, 5.2, …), adapter address, driver version and date.
 - **Forget this adapter.** Removes an unplugged adapter and everything Windows remembers for it.
 
@@ -68,9 +72,17 @@ toolchains, with no resource compiler needed (the manifest is embedded by `build
   device to its radio via `DEVPKEY_Device_Parent`. A full scan takes ~40 ms and runs off the UI thread.
 - Battery, device type, last-connected time and the radio's LMP version come from the device
   properties Windows already caches. No pairing or radio traffic is involved.
-- Changes use `pnputil` (enable/disable/restart/remove), the Service Control Manager, the
-  registry (`DisableAbsoluteVolume`) and WMI `MSPower_DeviceEnable` (power saving). Unpairing
-  uses `BluetoothRemoveDevice`.
+- Changes use `pnputil` (enable/disable/remove), SetupAPI `DIF_PROPERTYCHANGE` (adapter restart,
+  which works on every Windows edition, unlike `pnputil /restart-device`), the Service Control Manager, and the
+  registry: `DisableAbsoluteVolume`, and the driver framework's `Device Parameters\WDF\IdleInWorkingState`
+  for power saving. Unpairing uses `BluetoothRemoveDevice`.
 - When not already elevated, the app relaunches itself once via UAC with `--apply`. The
   elevated copy only touches devices it verifies are Bluetooth devices.
 - `bluetooth-bs-fixer.exe --dump out.txt` writes what the scanner sees, for troubleshooting or bug reports.
+
+## Tested
+
+Tested on Windows 11 (build 26200) with a MediaTek RZ616 adapter and a Realtek USB dongle:
+scanning, switching UI, headset-mic toggle, absolute volume, power saving, Restart Bluetooth and
+the elevated helper's safety checks. *Forget device*, *Clean up old devices* and *Forget this
+adapter* haven't been run on real devices yet, because they permanently remove pairings.

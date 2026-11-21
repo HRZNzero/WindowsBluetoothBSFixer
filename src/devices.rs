@@ -35,6 +35,13 @@ const HFP_SERVICE: &str = "BTHENUM\\{0000111E-0000-1000-8000-00805F9B34FB}";
 
 pub const ABS_VOLUME_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Bluetooth\Audio\AVRCP\CT";
 pub const ABS_VOLUME_VALUE: &str = "DisableAbsoluteVolume";
+/// Where KMDF drivers (BTHUSB and friends) keep Device Manager's
+/// "Allow the computer to turn off this device to save power" checkbox.
+pub const POWER_VALUE: &str = "IdleInWorkingState";
+
+pub fn power_key(instance_id: &str) -> String {
+    format!(r"SYSTEM\CurrentControlSet\Enum\{instance_id}\Device Parameters\WDF")
+}
 
 #[repr(C)]
 struct DevPropKey {
@@ -165,9 +172,15 @@ pub struct Adapter {
     pub driver_version: Option<String>,
     pub driver_provider: Option<String>,
     pub driver_date: Option<u64>,
+    /// Windows may power the adapter down when idle. None = not set (driver default: on).
+    pub power_saving: Option<bool>,
 }
 
 impl Adapter {
+    pub fn power_saving_on(&self) -> bool {
+        self.power_saving.unwrap_or(true)
+    }
+
     pub fn state_text(&self) -> &'static str {
         match (self.node.present, self.node.disabled, self.active) {
             (false, true, _) => "Off · not plugged in",
@@ -198,11 +211,16 @@ impl Snapshot {
         for a in &self.adapters {
             let _ = writeln!(
                 s,
-                "[{}] {} ({}) BT {} addr {} driver {} {}  {}",
+                "[{}] {} ({}) BT {} power-saving {} addr {} driver {} {}  {}",
                 a.state_text(),
                 a.node.name,
                 a.node.manufacturer,
                 a.version_text(),
+                match a.power_saving {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "default",
+                },
                 a.address.map(format_address).unwrap_or_default(),
                 a.driver_version.as_deref().unwrap_or("?"),
                 a.driver_date.map(format_date).unwrap_or_default(),
@@ -357,6 +375,7 @@ pub fn scan() -> Snapshot {
                 driver_version: buf.string(n.inst, &DRIVER_VERSION),
                 driver_provider: buf.string(n.inst, &DRIVER_PROVIDER),
                 driver_date: buf.filetime(n.inst, &DRIVER_DATE),
+                power_saving: read_hklm_dword(&power_key(&n.id), POWER_VALUE).map(|v| v != 0),
                 node: n,
                 active: false,
                 devices: Vec::new(),

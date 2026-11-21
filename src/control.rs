@@ -17,8 +17,14 @@ use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, 
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD,
 };
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList, SetupDiGetDeviceInstallParamsW,
+    SetupDiOpenDeviceInfoW, SetupDiSetClassInstallParamsW, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA,
+    SP_DEVINSTALL_PARAMS_W, SP_PROPCHANGE_PARAMS,
+};
 use windows_sys::Win32::System::Services::{
-    CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus, StartServiceW, SERVICE_STATUS,
+    CloseServiceHandle, ControlService, EnumDependentServicesW, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+    StartServiceW, ENUM_SERVICE_STATUSW, SC_HANDLE, SERVICE_STATUS,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
@@ -36,6 +42,14 @@ const SERVICE_START: u32 = 0x10;
 const SERVICE_STOP: u32 = 0x20;
 const SERVICE_CONTROL_STOP: u32 = 1;
 const SERVICE_STOPPED: u32 = 1;
+const SERVICE_ENUMERATE_DEPENDENTS: u32 = 0x8;
+const SERVICE_ACTIVE: u32 = 0x1;
+const SERVICE_STATE_ALL: u32 = 0x3;
+const DIF_PROPERTYCHANGE: u32 = 0x12;
+const DICS_PROPCHANGE: u32 = 3;
+const DICS_FLAG_CONFIGSPECIFIC: u32 = 2;
+const DI_NEEDRESTART: u32 = 0x80;
+const DI_NEEDREBOOT: u32 = 0x100;
 const BT_SERVICE: &str = "bthserv";
 
 #[derive(Clone)]
@@ -227,15 +241,17 @@ fn run_one(op: &Op) -> OpResult {
         Op::Enable { id, .. } => pnputil(&["/enable-device", id]),
         Op::Disable { id, .. } => pnputil(&["/disable-device", id]),
         Op::Remove { id, .. } => pnputil(&["/remove-device", id, "/subtree"]),
-        Op::RestartBluetooth { id, .. } => {
-            let service = restart_service(BT_SERVICE);
-            let (ok, msg) = pnputil(&["/restart-device", id]);
-            match service {
-                Ok(()) => (ok, if ok { "Bluetooth service and adapter restarted".to_owned() } else { msg }),
-                Err(e) => (ok, if ok { format!("Adapter restarted (service: {e})") } else { msg }),
+        Op::RestartBluetooth { id, .. } => restart_bluetooth(id),
+        Op::PowerSaving { id, allow, .. } => {
+            match set_hklm_dword(&devices::power_key(id), devices::POWER_VALUE, *allow as u32) {
+                Err(e) => (false, e),
+                // The driver reads the setting when it starts, so restart the adapter if it's plugged in.
+                Ok(()) => match restart_device(id) {
+                    Ok(false) => (true, "Saved, adapter restarted".to_owned()),
+                    _ => (true, "Saved \u{2014} takes effect after Windows restarts".to_owned()),
+                },
             }
         }
-        Op::PowerSaving { id, allow, .. } => set_power_saving(id, *allow),
         Op::AbsoluteVolume { enabled } => match set_hklm_dword(
             devices::ABS_VOLUME_KEY,
             devices::ABS_VOLUME_VALUE,
@@ -270,38 +286,160 @@ fn pnputil(args: &[&str]) -> (bool, String) {
     }
 }
 
-fn restart_service(name: &str) -> Result<(), String> {
+/// Restarts a device the way Device Manager / devcon do (DIF_PROPERTYCHANGE), which works on
+/// every Windows edition, unlike `pnputil /restart-device`. Ok(true) = Windows needs a reboot
+/// to finish (something held the device open).
+fn restart_device(id: &str) -> Result<bool, String> {
     unsafe {
-        let scm = OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT);
-        if scm.is_null() {
-            return Err(format!("can't open service manager ({})", GetLastError()));
+        let set = SetupDiCreateDeviceInfoList(null(), null_mut());
+        if set as isize == -1 {
+            return Err(format!("SetupAPI error {}", GetLastError()));
         }
-        let svc = OpenServiceW(scm, wide(name).as_ptr(), SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS);
-        if svc.is_null() {
-            let e = GetLastError();
-            CloseServiceHandle(scm);
-            return Err(format!("can't open {name} ({e})"));
-        }
-        let mut status: SERVICE_STATUS = zeroed();
+        let mut data: SP_DEVINFO_DATA = zeroed();
+        data.cbSize = size_of::<SP_DEVINFO_DATA>() as u32;
         let result = (|| {
-            if ControlService(svc, SERVICE_CONTROL_STOP, &mut status) == 0 && GetLastError() != ERROR_SERVICE_NOT_ACTIVE {
-                return Err(format!("couldn't stop ({})", GetLastError()));
+            if SetupDiOpenDeviceInfoW(set, wide(id).as_ptr(), null_mut(), 0, &mut data) == 0 {
+                return Err(format!("device not found ({})", GetLastError()));
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while QueryServiceStatus(svc, &mut status) != 0 && status.dwCurrentState != SERVICE_STOPPED {
-                if Instant::now() > deadline {
-                    return Err("didn't stop in time".to_owned());
-                }
-                std::thread::sleep(Duration::from_millis(150));
+            let mut params: SP_PROPCHANGE_PARAMS = zeroed();
+            params.ClassInstallHeader.cbSize = size_of::<SP_CLASSINSTALL_HEADER>() as u32;
+            params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+            params.StateChange = DICS_PROPCHANGE;
+            params.Scope = DICS_FLAG_CONFIGSPECIFIC;
+            if SetupDiSetClassInstallParamsW(set, &data, &params.ClassInstallHeader, size_of::<SP_PROPCHANGE_PARAMS>() as u32)
+                == 0
+                || SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, &data) == 0
+            {
+                return Err(format!("restart refused ({})", GetLastError()));
             }
-            if StartServiceW(svc, 0, null()) == 0 && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING {
-                return Err(format!("couldn't start ({})", GetLastError()));
-            }
-            Ok(())
+            let mut install: SP_DEVINSTALL_PARAMS_W = zeroed();
+            install.cbSize = size_of::<SP_DEVINSTALL_PARAMS_W>() as u32;
+            Ok(SetupDiGetDeviceInstallParamsW(set, &data, &mut install) != 0
+                && install.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART) != 0)
         })();
-        CloseServiceHandle(svc);
-        CloseServiceHandle(scm);
+        SetupDiDestroyDeviceInfoList(set);
         result
+    }
+}
+
+struct Scm(SC_HANDLE);
+
+impl Drop for Scm {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CloseServiceHandle(self.0) };
+        }
+    }
+}
+
+fn open_service(scm: &Scm, name: &str, access: u32) -> Result<Scm, String> {
+    let h = unsafe { OpenServiceW(scm.0, wide(name).as_ptr(), access) };
+    if h.is_null() { Err(format!("can't open {name} ({})", unsafe { GetLastError() })) } else { Ok(Scm(h)) }
+}
+
+fn open_scm() -> Result<Scm, String> {
+    let h = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT) };
+    if h.is_null() { Err(format!("can't open the service manager ({})", unsafe { GetLastError() })) } else { Ok(Scm(h)) }
+}
+
+/// Stop the Bluetooth Support Service (and the per-user BluetoothUserService that depends on
+/// it), restart the radio while nothing holds it, then always start the services again.
+fn restart_bluetooth(id: &str) -> (bool, String) {
+    let scm = match open_scm() {
+        Ok(s) => s,
+        Err(e) => return (false, e),
+    };
+    let main = match open_service(
+        &scm,
+        BT_SERVICE,
+        SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_ENUMERATE_DEPENDENTS,
+    ) {
+        Ok(s) => s,
+        Err(e) => return (false, e),
+    };
+
+    for dep in dependents(&main, SERVICE_ACTIVE) {
+        if let Ok(d) = open_service(&scm, &dep, SERVICE_STOP | SERVICE_QUERY_STATUS) {
+            let _ = stop_and_wait(&d);
+        }
+    }
+    // bthserv can take a long time to stop; carry on either way, the start below recovers it.
+    let _ = stop_and_wait(&main);
+    let device = restart_device(id);
+
+    // Bring everything back no matter what happened above. Dependents include stopped
+    // per-user instances (BluetoothUserService_xxxxx), which also repairs a half-stopped stack.
+    let start = start_service(&main, BT_SERVICE);
+    for dep in dependents(&main, SERVICE_STATE_ALL) {
+        if let Ok(d) = open_service(&scm, &dep, SERVICE_START) {
+            let _ = start_service(&d, &dep); // the template "BluetoothUserService" can't start; fine
+        }
+    }
+
+    match (start, device) {
+        (Err(e), _) => (false, format!("The Bluetooth service didn't start again: {e}")),
+        (Ok(()), Err(e)) => (false, format!("Service restarted, but the adapter couldn't be restarted: {e}")),
+        (Ok(()), Ok(false)) => (true, "Bluetooth service and adapter restarted".to_owned()),
+        (Ok(()), Ok(true)) => (
+            true,
+            "Bluetooth service restarted. Windows will finish resetting the adapter itself the next time the PC \
+             restarts \u{2014} if problems continue, restart the PC."
+                .to_owned(),
+        ),
+    }
+}
+
+fn start_service(svc: &Scm, name: &str) -> Result<(), String> {
+    if unsafe { StartServiceW(svc.0, 0, null()) } == 0 {
+        let e = unsafe { GetLastError() };
+        if e != ERROR_SERVICE_ALREADY_RUNNING {
+            return Err(format!("couldn't start {name} ({e})"));
+        }
+    }
+    Ok(())
+}
+
+fn stop_and_wait(svc: &Scm) -> Result<(), String> {
+    unsafe {
+        let mut status: SERVICE_STATUS = zeroed();
+        if ControlService(svc.0, SERVICE_CONTROL_STOP, &mut status) == 0 {
+            let e = GetLastError();
+            if e != ERROR_SERVICE_NOT_ACTIVE {
+                return Err(format!("couldn't stop ({e})"));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while QueryServiceStatus(svc.0, &mut status) != 0 && status.dwCurrentState != SERVICE_STOPPED {
+            if Instant::now() > deadline {
+                return Err("didn't stop in time".to_owned());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    }
+}
+
+fn dependents(svc: &Scm, state: u32) -> Vec<String> {
+    unsafe {
+        let mut needed = 0u32;
+        let mut count = 0u32;
+        EnumDependentServicesW(svc.0, state, null_mut(), 0, &mut needed, &mut count);
+        if needed == 0 {
+            return Vec::new();
+        }
+        // u64 storage keeps the ENUM_SERVICE_STATUSW array properly aligned.
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        let entries = buf.as_mut_ptr() as *mut ENUM_SERVICE_STATUSW;
+        if EnumDependentServicesW(svc.0, state, entries, needed, &mut needed, &mut count) == 0 {
+            return Vec::new();
+        }
+        (0..count as usize)
+            .map(|i| {
+                let p = (*entries.add(i)).lpServiceName;
+                let len = (0..).take_while(|&j| *p.add(j) != 0).count();
+                String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+            })
+            .collect()
     }
 }
 
@@ -329,64 +467,6 @@ fn set_hklm_dword(subkey: &str, value: &str, data: u32) -> Result<(), String> {
         RegCloseKey(hkey);
         if rc == 0 { Ok(()) } else { Err(format!("registry error {rc}")) }
     }
-}
-
-/// The power-management checkbox is exposed through WMI (MSPower_DeviceEnable), which is
-/// simplest to drive from PowerShell. Runs elevated, once, on explicit request.
-fn set_power_saving(id: &str, allow: bool) -> (bool, String) {
-    let script = format!(
-        "$ErrorActionPreference='Stop'; $id='{}'; try {{ \
-         $x = @(Get-CimInstance -Namespace root\\wmi -ClassName MSPower_DeviceEnable | \
-               Where-Object {{ $_.InstanceName.StartsWith($id, [StringComparison]::OrdinalIgnoreCase) }}); \
-         if ($x.Count -eq 0) {{ 'UNSUPPORTED'; exit 0 }}; \
-         $was = $x[0].Enable; foreach ($i in $x) {{ Set-CimInstance -InputObject $i -Property @{{Enable=${}}} }}; \
-         \"WAS:$was\" }} catch {{ 'ERR:' + $_.Exception.Message }}",
-        id.replace('\'', "''"),
-        if allow { "true" } else { "false" }
-    );
-    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let output = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"))
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &base64(&utf16)])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match output {
-        Err(e) => (false, e.to_string()),
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if text.contains("UNSUPPORTED") {
-                (false, "This adapter's driver doesn't offer a power-saving setting.".to_owned())
-            } else if let Some(was) = text.lines().find_map(|l| l.trim().strip_prefix("WAS:")) {
-                let was_on = was.eq_ignore_ascii_case("true");
-                let state = if allow { "on" } else { "off" };
-                if was_on == allow {
-                    (true, format!("Power saving was already {state}"))
-                } else {
-                    (true, format!("Power saving is now {state}"))
-                }
-            } else if let Some(err) = text.lines().find_map(|l| l.trim().strip_prefix("ERR:")) {
-                (false, err.trim().to_owned())
-            } else {
-                (false, "PowerShell didn't return a result.".to_owned())
-            }
-        }
-    }
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
-        for i in 0..4 {
-            if i <= chunk.len() {
-                s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                s.push('=');
-            }
-        }
-    }
-    s
 }
 
 fn parse_result(line: &str) -> Option<OpResult> {
