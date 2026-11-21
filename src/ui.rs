@@ -1039,15 +1039,19 @@ impl App {
 
     unsafe fn cmd_forget_device(&self) {
         let Some(sel) = self.selected_device() else { return };
-        let (name, address, on_active, ops) = {
+        let (name, address, on_active, ops, adapter_name) = {
             let snap = self.snap.borrow();
             let Some(d) = device_at(&snap, sel) else { return };
-            let on_active = sel.0 != ORPHAN && snap.adapters.get(sel.0).is_some_and(|a| a.active);
-            (d.node.name.clone(), d.address_raw(), on_active, remove_ops(d))
+            let adapter = snap.adapters.get(sel.0);
+            let on_active = adapter.is_some_and(|a| a.active);
+            let adapter_name = adapter.map(|a| a.node.name.clone()).unwrap_or_else(|| "an adapter that's gone".to_owned());
+            (d.node.name.clone(), d.address_raw(), on_active, remove_ops(d), adapter_name)
         };
+        // Names repeat (one keyboard can have several pairings), so show what makes this one unique.
+        let addr_text = address.map(format_address).unwrap_or_default();
         if !self.confirm(&format!(
-            "Forget \u{201C}{name}\u{201D}?\n\nYou'll have to pair it again to use it. Tip: if it's stuck, put the device \
-             itself in pairing mode before pairing again."
+            "Forget \u{201C}{name}\u{201D}?\n\nAddress:\t{addr_text}\nPaired with:\t{adapter_name}\n\nYou'll have to pair it \
+             again to use it. Tip: if it's stuck, put the device itself in pairing mode before pairing again."
         )) {
             return;
         }

@@ -83,6 +83,8 @@ toolchains, with no resource compiler needed (the manifest is embedded by `build
 ## Tested
 
 Tested on Windows 11 (build 26200) with a MediaTek RZ616 adapter and a Realtek USB dongle:
-scanning, switching UI, headset-mic toggle, absolute volume, power saving, Restart Bluetooth and
-the elevated helper's safety checks. *Forget device*, *Clean up old devices* and *Forget this
-adapter* haven't been run on real devices yet, because they permanently remove pairings.
+scanning, switching UI, headset-mic toggle, absolute volume, power saving, Restart Bluetooth,
+Forget device (a leftover entry on an unplugged adapter) and the elevated helper's safety checks.
+Not yet tested on real devices: *Clean up old devices* and *Forget this adapter* (they remove many
+entries at once), unpairing a device on the active adapter, and *Use this adapter* with two
+adapters plugged in.
