@@ -1,47 +1,76 @@
 # Windows Bluetooth BS Fixer
 
-A tiny native Windows 11 app that lets you pick **which Bluetooth adapter Windows uses**.
+A small, fast, native Windows 10/11 app for the Bluetooth problems Windows doesn't give you a
+button for: pick which Bluetooth adapter Windows uses, restart a stuck Bluetooth stack, stop
+headphones dropping to mono call quality, clear out ghost devices, and more.
 
-Windows only runs one Bluetooth radio at a time and gives you no setting to choose it, so a
-better USB dongle often gets ignored in favour of the onboard chip. This app lists every
-adapter Windows knows about (plugged in or not), shows which paired devices belong to which
-adapter, and with one click switches the others off so Windows has to use the one you picked.
+One ~500 KB exe, no installer, no runtime. Written in Rust on the raw Win32 API.
 
-## Features
+## What it does
 
-- Lists all Bluetooth adapters with their state: *In use*, *Off*, *Not plugged in*, *On but unused*
-- Paired devices grouped by the adapter they were paired with, with live connection status
-- **Use this adapter**: enables your pick and disables the other present adapters (one UAC prompt)
-- **Turn all adapters back on**: one-click undo
-- Refreshes by itself when hardware is plugged or unplugged
-- Warns when a proprietary 2.4 GHz receiver (Logitech LIGHTSPEED/Unifying/Bolt, etc.) is present.
-  Those aren't Bluetooth and can't be "switched", but they share the 2.4 GHz band and are a
-  common cause of Bluetooth lag. Separating them with USB extension cables usually helps.
+**Adapters**
+
+- **Use this adapter.** Windows runs only one Bluetooth adapter at a time and has no setting to
+  choose it, so a better USB dongle often gets ignored in favour of the built-in chip. Pick the
+  adapter you want and the others get switched off, so Windows has to use it. *Turn all adapters
+  back on* undoes it.
+- **Restart Bluetooth.** Restarts the Bluetooth Support Service and the adapter. This is the usual fix when
+  Bluetooth stops working, the on/off toggle disappears, or devices refuse to connect.
+- **Stop power saving.** Unticks Device Manager's *Allow the computer to turn off this device
+  to save power*, the classic fix for devices that drop out or don't come back after sleep.
+- **Details.** Bluetooth version (5.0, 5.2, …), adapter address, driver version and date.
+- **Forget this adapter.** Removes an unplugged adapter and everything Windows remembers for it.
+
+**Devices** (grouped by the adapter they're paired with)
+
+- Type (headphones, keyboard, mouse, …), **battery level** where the device reports it,
+  connection status and **last connected** time.
+- **Forget device.** Unpairs properly, and falls back to removing the device entries when a
+  device is stuck and won't remove in Settings.
+- **Turn off headset mic.** Windows switches Bluetooth headphones to low-quality mono
+  "hands-free" mode whenever an app opens their mic. Turning the headset mic off keeps them in
+  full-quality stereo (use another mic). Can be turned back on any time.
+- **Clean up old devices.** Removes leftover and duplicate "ghost" entries that belong to adapters
+  that are no longer plugged in.
+
+**Audio**
+
+- **Absolute volume** on/off. Turn it off when the volume is far too loud or quiet, jumps
+  around, or Windows and the headphones fight over it.
+
+**Plus** live refresh when hardware is plugged or unplugged, shortcuts to Bluetooth settings,
+Sound settings, Device Manager and the Windows troubleshooters, and a *Troubleshooting tips*
+page (Help menu). Most commands are also on right-click.
 
 ## Things to know
 
-- **Pairings are per adapter.** After switching, devices that were never paired with the new
-  adapter need to be paired again (the app offers to open Bluetooth settings).
-- If your keyboard is Bluetooth it will drop during the switch, so finish pairing with the mouse.
-- Disabling survives reboots. If you unplug the dongle you picked, open the app and hit
-  *Turn all adapters back on*, or the onboard adapter stays off.
+- **Pairings belong to an adapter.** After switching adapters, devices that were never paired
+  with the new one need pairing again. The app offers to open Bluetooth settings.
+- If your keyboard or mouse is Bluetooth it drops during a switch or restart. Keep a wired one
+  handy, just in case.
+- Switching adapters survives reboots. If you unplug the dongle you picked, use *Turn all
+  adapters back on*, or the built-in adapter stays off.
+- Changes need admin rights; the app asks once per action via the normal Windows UAC prompt.
 
 ## Build
-
-Rust, Win32 API via `windows-sys`, no runtime dependencies. Release exe is ~460 KB.
 
 ```powershell
 cargo build --release
 ```
 
-The exe lands in `target\release\bt-switcher.exe`. Works with both the MSVC and GNU Rust toolchains.
+The exe lands in `target\release\bluetooth-bs-fixer.exe`. It builds with both the MSVC and GNU Rust
+toolchains, with no resource compiler needed (the manifest is embedded by `build.rs`).
 
 ## How it works
 
-- Device discovery uses CfgMgr32 (`CM_Get_Device_ID_List`, `CM_Get_DevNode_Property`) directly,
-  including non-present device nodes, and maps each paired device → Microsoft BT enumerator →
-  radio through `DEVPKEY_Device_Parent`. A full scan takes ~30 ms and runs off the UI thread.
-- Switching runs `pnputil /enable-device` / `/disable-device`. When the app isn't elevated it
-  relaunches itself once via UAC with `--apply`, and the elevated copy only touches devices it
-  verifies are Bluetooth adapters.
-- `bt-switcher.exe --dump out.txt` writes what the scanner sees, for troubleshooting.
+- Discovery reads the PnP device tree directly through CfgMgr32 (`CM_Get_Device_ID_List`,
+  `CM_Get_DevNode_Property`), including entries for unplugged hardware, and maps every paired
+  device to its radio via `DEVPKEY_Device_Parent`. A full scan takes ~40 ms and runs off the UI thread.
+- Battery, device type, last-connected time and the radio's LMP version come from the device
+  properties Windows already caches. No pairing or radio traffic is involved.
+- Changes use `pnputil` (enable/disable/restart/remove), the Service Control Manager, the
+  registry (`DisableAbsoluteVolume`) and WMI `MSPower_DeviceEnable` (power saving). Unpairing
+  uses `BluetoothRemoveDevice`.
+- When not already elevated, the app relaunches itself once via UAC with `--apply`. The
+  elevated copy only touches devices it verifies are Bluetooth devices.
+- `bluetooth-bs-fixer.exe --dump out.txt` writes what the scanner sees, for troubleshooting or bug reports.
